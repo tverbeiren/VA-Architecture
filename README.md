@@ -31,6 +31,7 @@ TODO
 ====
 
 * Remove dependency on JQuery.
+* Remove return-based and stick with CPS based implementation of Locustree
 * Add more information on implementation
 * Split visualization and locustree layers.
 * Add instructions on how to compile and run
