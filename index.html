@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html>
+<head>
+<script type="text/javascript" src="lib/d3.v3.min.js"></script>
+<script type="text/javascript" src="lib/jquery.js"></script>
+<script type="text/javascript" src="lib/require.js"></script>
+
+<style>
+body { font: 12px Arial;}
+
+path { 
+    stroke: steelblue;
+    stroke-width: 2;
+    fill: none;
+}
+
+.axis path,
+.axis line {
+    fill: none;
+    stroke: grey;
+    stroke-width: 1;
+    shape-rendering: crispEdges;
+}
+
+</style>
+
+</head>
+<body>
+<script>
+
+// --TODO
+// - colour the currently active aggregation function
+// - add average to functions (server side)
+// - add context variable to hold context for the app?
+
+
+// Variables for vis and zoom
+// -- Todo: make this as dynamic as possible
+// -- e.g.: N can be made a parameter that is provided to the algorithm
+var N = 100;
+var Z = 10;
+
+// Variables for the job, this are returned by the first call
+// --TODO: Make this dynamic
+var RDD = "0";
+var low = 1;
+var high = 63806650;
+
+// Connection info:
+// --TODO: let the user give this in at runtime
+var server = 'ly-1-01';
+var port = 8090;
+var classPath = "spark.jobserver.CovQuery";
+var appName = "Cov";
+
+// Function for listing the options in the url
+var QueryString = function () {
+  // This function is anonymous, is executed immediately and 
+  // the return value is assigned to QueryString!
+  var query_string = {};
+  var query = window.location.search.substring(1);
+  var vars = query.split("&");
+  for (var i=0;i<vars.length;i++) {
+    var pair = vars[i].split("=");
+      // If first entry with this name
+    if (typeof query_string[pair[0]] === "undefined") {
+      query_string[pair[0]] = pair[1];
+      // If second entry with this name
+    } else if (typeof query_string[pair[0]] === "string") {
+      var arr = [ query_string[pair[0]], pair[1] ];
+      query_string[pair[0]] = arr;
+      // If third or later entry with this name
+    } else {
+      query_string[pair[0]].push(pair[1]);
+    }
+  } 
+    return query_string;
+} ();
+
+// Mike's solution to make sure transitions have finished before continuing
+function endall(transition, callback) { 
+    var n = 0; 
+    transition 
+        .each(function() { ++n; }) 
+        .each("end", function() { if (!--n) callback.apply(this, arguments); }); 
+  } 
+
+
+// Key Function for the bars, x+y coordinates are used
+function keyf(d) {
+  var res = d[1][0] + "-" + d[1][index];
+  return res;
+}
+
+// This is handy to access the last element
+Object.defineProperty(Array.prototype, 'last', {
+    enumerable: false,
+    configurable: true,
+    get: function() {
+        return this[this.length - 1];
+    },
+    set: undefined
+});
+
+// Get the proper aggregation method to start with
+// Adding ?func=sum/coun/max/min gives the appropriate result immediately
+var func = "";  // Not used after this, but could come in handy
+var index = 0;
+switch(QueryString.func) {
+  case "index": 
+    func = "index"; 
+    index = 0;
+    break;
+  case "sum": 
+    func = "sum"; 
+    index = 1;
+    break;
+  case "max": 
+    index = 2;
+    func = "max"; 
+    break;
+  case "min": 
+    func = "min"; 
+    index = 3;
+    break;
+  case "count": 
+    func = "count"; 
+    index = 4;
+    break;
+  case "avg": 
+    func = "avg"; 
+    index = 5;
+    break;
+  default:
+    index = 1;
+    func = "sum";
+};
+  
+  // HELPER FUNCTIONS for querying
+  function urlQueryBuilder(server, port, appName, classPath, context) {
+    return "http://" + server + ":" + port + "/jobs?appName=" + appName 
+    + "&classPath=" + classPath + "&context=" + context + "&sync=true";
+  }
+
+  function postQueryBuilder(RDD, chr, path) {
+    return "RDD = " + RDD + "\n" + "chr = " + chr + "\n" + "path = " + path + "\n" + "low = " + low + "\n" + "high = " + high + "\n" + "function = " + func;
+  }
+
+
+
+        requirejs.config({
+            paths: {
+                'nu-stream': 'nu/dist',
+                'neith': 'neith/dist',
+                'examples': 'neith/examples'
+            }
+        });
+       // var list1;
+
+require(['require','nu-stream/stream','neith/zipper','neith/tree','neith/list'],
+  function (require,stream,zipper,tree,list) {
+
+     var zipper = require('neith/zipper');
+     var stream = require('nu-stream/stream');
+     var tree = require('neith/tree');
+     var list = require('neith/list');     
+
+
+// SETUP THE LOCUSTREE ------------------------------------------------
+var Nary = function(value, children, childValues) {
+    this.value = value;
+    this.children = children;
+    this.childValues = childValues;
+};
+
+Nary.construct = function(x, edges, children) {
+    var c = stream.toArray(edges);
+    return new Nary(x.value,
+        c.map(tree.pairKey),
+        children());
+};
+var walk = function(root, path) {
+    path = path || [];
+    return (root ?
+        root.children.reduce(function(p, c) {
+            return walk(root.childValues[c], p)
+        }, path.concat(root.value)) :
+        path);
+};
+var naryZipper = function(root) {
+    return tree.treeZipper(
+        function(x) { return stream.from(x.children); },
+        function(x, k) { return x.childValues[k]; },
+        Nary.construct,
+        root);
+};
+var $n = function(val, children) {
+    return new Nary(val, Object.keys(children), children);
+};
+
+
+// Setting up the canvas
+var w = 800;
+var h = 800;
+var padding = 80;
+
+var svg = d3.select("body").append("svg")
+          .attr("width", w).attr("height",h);
+
+
+// These grouping are REQUIRED !!!
+var label = svg.append("text");
+var paths = svg.append("text");
+var boxesSvg = svg.append("g");
+var dataSvg = svg.append("g");
+var xaxisSvg = svg.append("g");
+var yaxisSvg = svg.append("g");
+var functs = svg.append("g");
+
+
+// Initialization
+//var root = $n('0',{});
+var root = $n('0',{});
+var rootz = naryZipper(root);
+
+// Starting up... CPS approach
+update_async(rootz,treeDraw);
+
+d3.selectAll("body").insert("h1","svg").text("Fetching data...");
+
+
+// update_async(rootz,function(tz) {zoomCache(tz,treeDraw)})
+
+// CACHING HELPERS, NOT USED YET ----------------------------------
+
+// This function caches the lower level of the current node
+function zoomCache(tz, cont) {
+ goDownAsync(0,tz,
+  function(tz) {panRightAsync(tz,
+    function(tz1) {panRightAsync(tz1,
+      function(tz2) {panRightAsync(tz2,
+        function(tz3) {panRightAsync(tz3,
+          function(tz4) {panRightAsync(tz4,
+            function(tz5) {panRightAsync(tz5,
+              function(tz6) {panRightAsync(tz6,
+                function(tz7) {panRightAsync(tz7,
+                  function(tz8) {panRightAsync(tz8,
+                    function(tz9) {panRightAsync(tz9,
+                      function(tz10) {goUpAsync(tz10, cont);}
+                    );});});});});});});});});});});};
+
+// This caches the lower level and writes it to a global variable.
+// Problem is it replaces the current view
+//zoomCache(rootz1,function(tz) {globalData = tz;});
+
+
+function goDown(i,tz) {
+  console.log(">>> Starting goDown...");
+  if (zipper.isLeaf(tz) === true) {
+    // Nothing exists yet, so create a child
+//    console.log(">> goDown called, nothing exists yet");
+    var prevPath = stream.toArray(tree.edgePath(tz)).reverse();
+    var path = prevPath.join(" ") + " " + i;
+    return tree.child(i,tree.appendChild(i,$n(getResultSync(path),{}),tz));
+  } else {
+      if ((stream.toArray(tree.edgePath(tree.child(i,tz)))).length === 0) {
+      // Does not exist yet
+      // Add the node and edge based on the path
+//      console.log(">> goDown called, does not exist yet");
+      var prevPath = stream.toArray(tree.edgePath(tz)).reverse();
+      var path = prevPath.join(" ") + " " + i;
+      return tree.child(i,tree.appendChild(i,$n(getResultSync(path),{}),tz));
+    } else {
+//      console.log(">> goDown called, exists already");
+      // exists already
+      // move focus
+      return tree.child(i,tz);
+     }
+  }
+}
+
+function goDownAsync(i,tz,cont) {
+  console.log(">>> Starting goDownAsync...");
+  if (zipper.isLeaf(tz) === true) {
+    // Nothing exists yet, so create a child
+    var prevPath = stream.toArray(tree.edgePath(tz)).reverse();
+    var path = prevPath.join(" ") + " " + i;
+    // Create empty node and update this
+    var tz1 = tree.child(i,tree.appendChild(i,$n([],{}),tz));
+    update_async(tz1, cont);
+  } else {
+      if ((stream.toArray(tree.edgePath(tree.child(i,tz)))).length === 0) {
+      // Does not exist yet
+      // Add the node and edge based on the path
+      var prevPath = stream.toArray(tree.edgePath(tz)).reverse();
+      var path = prevPath.join(" ") + " " + i;
+      // Create empty node and update this
+      var tz1 = tree.child(i,tree.appendChild(i,$n([],{}),tz));
+      update_async(tz1, cont);
+    } else {
+      // exists already
+      // move focus
+      cont(tree.child(i,tz));
+     }
+  }
+}
+
+function goUp(tz) {
+  console.log(">>> Starting goUp...");
+  if (zipper.isRoot(tz) === true) {
+//    console.log(">> goUp on Root, return root again");
+    return tz;
+  } else {
+//    console.log(">> goUp on non-root");
+    return zipper.up(tz);
+  }
+}
+
+function goUpAsync(tz,cont) {
+  console.log(">>> Starting goUp...");
+  if (zipper.isRoot(tz) === true) {
+    // Do nothing, just pass function along
+    cont(tz);
+  } else {
+    // Go up
+    cont(zipper.up(tz));
+  }
+}
+
+function panLeft(tz) {
+  // Idea: go left, based on goUp and goDown
+  if (zipper.isRoot(tz) === true) {
+    // At root node, return it again
+    return tz;
+  } else if (zipper.extract(tz).key == '0') {
+    // Already at index '0'
+//    console.log(">> goLeft called, already at 0, go up, left and down again");
+    var parent = goUp(tz);
+    return goDown(Z-1,panLeft(parent));
+  } else {
+    // Not yet at index '0', use primitives defined earlier...
+//    console.log(">> goLeft called, not yet there... " + zipper.extract(tz).key);
+    var parent = goUp(tz);
+    var i = zipper.extract(tz).key;
+    return goDown(i-1,parent);
+  }
+} 
+
+function panLeftAsync(tz,cont) {
+  // Idea: go left, based on goUp and goDown
+  if (zipper.isRoot(tz) === true) {
+    // At root node, return it again
+    cont(tz);
+  } else if (zipper.extract(tz).key == '0') {
+    // Already at index '0', select rightmost area of previous 'block'
+    goUpAsync(tz,
+      function(tz1) { panLeftAsync(tz1, 
+        function(tz2) { goDownAsync(Z-1,tz2,cont);});});
+  } else {
+    // Not yet at index '0', use primitives defined earlier...
+    var i = zipper.extract(tz).key;
+    goUpAsync(tz,function(tz1) {goDownAsync(i-1,tz1,cont)});
+
+  }
+} 
+
+function panRight(tz) {
+  // Similar to panRight
+  if (zipper.isRoot(tz) === true) {
+    // At root node, return it again
+    return tz;
+  } else if (zipper.extract(tz).key == Z-1) {
+    // Already at index Z-1
+    var parent = goUp(tz);
+    return goDown(0,panRight(parent));
+  } else {
+    // Not yet at index '0', use primitives defined earlier...
+    var parent = goUp(tz);
+    var i = zipper.extract(tz).key;
+    return goDown(i+1,parent);
+  }
+}
+
+function panRightAsync(tz,cont) {
+  // Similar to panRight
+  if (zipper.isRoot(tz) === true) {
+    // At root node, return it again
+    cont(tz);
+  } else if (zipper.extract(tz).key == Z-1) {
+    // Already at index Z-1
+    goUpAsync(tz,
+      function(tz1) { panRightAsync(tz1, 
+        function(tz2) { goDownAsync(0,tz2, cont);});});
+  } else {
+    // Not yet at index 'Z-1', use primitives defined earlier...
+    var i = zipper.extract(tz).key;
+    goUpAsync(tz,function(tz1) {goDownAsync(i+1,tz1,cont)});
+  }
+}
+
+function getData(tz) {
+  return dataset = zipper.extract(tz).value.value;
+}
+
+function getPath(tz) {
+  return path = stream.toArray(tree.edgePath(tz)).reverse();
+}
+
+
+// UPDATE TREE BASED ON QUERY
+// Old approach, bit of a hack using asynchronous setting of jQuery
+function update_sync(path) {
+
+  jQuery.ajaxSetup({async:false});
+  console.log("Starting sync update...");
+
+  var urlQuery = urlQueryBuilder(server,port,appName,classPath,"my_context");
+  var postQuery = postQueryBuilder(RDD,"19",path);
+
+  
+//  d3.selectAll("body").append("h2").text("Fetching data...");
+
+  // Ok, this is a hack. In order to avoid to handle async calls,
+  // I make jquery do sync calls to the webservice.
+  // This way, I can return a value.
+  var returnResult = [];
+
+  // Different approach, using jQuery:
+  $.post(
+    urlQuery,
+    postQuery,
+    function(response,status) {
+      returnResult = response.result;
+    }
+  );
+  return returnResult;
+};
+
+// UPDATE TREE BASED ON QUERY
+// This update is always called from a goDownAsync
+// Which means, we can put some logic in this...
+function update_async(tz, cont) {
+
+
+  if (zipper.isRoot(tz)) {
+    var key = 0;
+  } else {
+    var key = zipper.extract(tz).key;
+  }
+
+  var prevPath = stream.toArray(tree.edgePath(tz)).reverse();
+  var path = prevPath.join(" ") + " " + key;
+
+  jQuery.ajaxSetup({async:true});
+  console.log("Starting async update...");
+
+  var urlQuery = urlQueryBuilder(server,port,appName,classPath,"my_context");
+  var postQuery = postQueryBuilder(RDD,"19",path);
+
+  // Different approach, using jQuery:
+  $.post(
+    urlQuery,
+    postQuery,
+    function(response,status) {
+      var tz1 = tree.setEdge(key,tree.setNode($n(response.result,{}),tz));
+      console.log(zipper.extract(tz1).value);
+      cont(tz1);
+    }
+  );
+};
+
+
+// DRAW THE node --------------------------------------------------------
+function treeDraw(tz) {
+
+//  zoomCache(tz, function(tz1){ globalData = tz; });
+
+  console.log("Start drawing...");
+  var dataset = getData(tz);
+  var path = getPath(tz);
+
+  console.log("dataset on path: (" + path + ") is " + dataset);
+
+  d3.selectAll("h1").remove();
+
+  // Zoom level is Z-1, so these are the intervals:
+  var zoom_data = d3.range(Z);
+
+  var yMax = d3.max(dataset, function(d){return d[1][index];});
+  var xMin = dataset[0][1][0];
+  var xMax_tmp = d3.max(dataset, function(d){return d[1][0];});
+  // The data passed from the query service results in the lower bound for every interval
+  // In order to now what the maximum value of the range is, we need to add 1 bin
+  // The width of the bin is added to the highest lower bound:
+  var xMax = xMax_tmp + (xMax_tmp - xMin)/N;
+
+  console.log("Maximum values in x and y direction:" + xMax + " " + yMax);
+  console.log("Path here is " + path);
+
+  var x = d3.scale.linear()
+          .domain([xMin,xMax])
+          .range([padding,w-padding]);
+  var y = d3.scale.linear()
+          .domain([0,yMax])
+          .range([padding,h-padding]);
+  var ybis = d3.scale.linear()
+          .domain([0,yMax+1])
+          .range([h-padding,padding]);
+
+  var zoom_x = d3.scale.linear()
+          .domain([0,Z])
+          .range([padding,w-padding]);
+
+  var xAxis = d3.svg.axis().scale(x).orient("bottom")
+                .ticks(5); //Set rough # of ticks;
+  
+  var yAxis = d3.svg.axis().scale(ybis).orient("left");
+
+  yaxisSvg.call(yAxis)
+                .attr("class", "y axis")
+                .attr("transform", "translate(" + (padding-3) + ",0)");
+
+  xaxisSvg.call(xAxis)
+                .attr("class", "x axis")
+                .attr("transform", "translate(0," + (h - padding+3) + ")");
+
+  label
+    .attr("x",10).attr("y",20)
+    .attr("font-size","13pt")
+    .attr("font-family","Verdana")
+    .attr("fill","SteelBlue")
+    .text("Coverage of chr19 for range (" + xMin + ", " + xMax.toExponential(0) + ") - Delta is " + ((xMax-xMin)/Z).toExponential(2));
+
+  paths
+    .attr("x",750).attr("y",padding +100)
+    .attr("font-size","10pt")
+    .attr("font-family","Verdana")
+    .attr("fill","SteelBlue")
+    .append("tspan") // append data to keep a trace
+      .attr("x",750).attr("dy",11)
+      .text(path);
+
+  // Buttons
+  var fboxes = functs.selectAll("rect")
+    .data(["sum","max","min","count","avg"]);
+
+  // Put the button text in place
+  fboxes 
+    .enter()  
+    .append("text")
+      .attr("x",750+50/2)
+      .attr("y",function(d,i) {return padding + 14/2 + 3 + i * 15;})
+      .style("text-anchor","middle")
+      .text(function(d){return d;});
+
+  // Put a semi-transarant box over the text, in order to make the
+  // whole thing 'clickable'.
+  fboxes
+    .enter()
+    .append("rect")
+     .attr("x",750)
+     .attr("y",function(d,i) {return padding + i * 15;})
+     .attr("width",50)
+     .attr("height",13)
+     .attr("opacity",0.2)
+     .attr("stroke","SteelBlue");
+
+  // On update (even the first time), 
+  // the highlighted box should be updated as well...
+  fboxes
+     .attr("fill", function(d,i) {
+        if (i === index-1) {
+          return "SteelBlue";
+        } 
+        else {
+          return "white";
+        }
+      });
+ 
+  functs.selectAll("rect").on("click", function (d,i) {
+    console.log("Click noticed on ... " + d + " " + i);
+    // Still a global variable!
+    index = 1+i;
+    treeDraw(tz);
+  });
+
+
+  // Zoom Boxes  
+  var zoomBoxData = boxesSvg.selectAll("rect")
+      .data(zoom_data);
+
+  var zoomBoxes = zoomBoxData
+      .enter()
+      .append("rect")
+      .attr("x",function(d,i){
+        console.log(zoom_x(d));
+        return zoom_x(d);
+      })
+      .attr("y",function(d,i){
+        return padding;
+      })
+      .attr("height",function(d,i){
+        return h - 2*padding;
+      })
+      .attr("width",function(d,i){
+        return zoom_x(1) - zoom_x(0);
+      })
+      .attr("fill","gray")
+      .attr("stroke",'black')
+      .attr("opacity",.05);
+
+  // By applying the selection again, the function gets refreshed
+  boxesSvg.selectAll("rect").on("click", function (d,i) {
+     console.log("Click noticed... " + d + " on path " + i + " " + path);
+     var data1 = dataset.slice(i*10,i*10+10);
+         //  var xMin = data1[0][1][0];
+         //  var xMax_tmp = d3.max(data1, function(d){return d[1][0];});
+         //  var xMax = xMax_tmp + (xMax_tmp - xMin)/10;
+
+         //  var x = d3.scale.linear()
+         //          .domain([xMin,xMax])
+         //          .range([padding,w-padding]);
+
+         //  xaxisSvg.call(xAxis)
+         //                .attr("class", "x axis")
+         //                .attr("transform", "translate(0," + (h - padding+3) + ")");
+
+         var tmp = dataSvg.selectAll("rect")
+                    .data(data1,keyf);
+
+         tmp.exit().remove();
+
+         tmp
+           .transition()
+         // This transition works, but needs some work to get it right  
+         //  //.duration(3000)
+         //  .attr("x",function(d,i){
+         //    return x(d[1][0]);
+         //  })
+         //  .attr("y",function(d,i){
+         //    return h - y(d[1][index]);
+         //  })
+         //  .attr("width",function(d){
+         //    return (w-2*padding)/N*10;  
+         //  })
+         //  .attr("height",function(d){
+         //    return y(d[1][index])-padding;
+         //  })
+         //  .attr("fill",'SteelBlue')
+         //  .attr("stroke",'white')
+         //  .attr("opacity",.5)
+           .call(endall,function() {goDownAsync(i,tz,treeDraw);});
+
+  });
+
+
+  // The effective data. A key function is specified in order
+  // to have all data displayed
+  var rectData = dataSvg.selectAll("rect")
+                  .data(dataset,keyf);
+
+
+  console.log("New data joined... ");
+
+  /* This is interesting: apparently the data is added to the results array
+     so I have to manually cut if off. That is the reason why the enter statement
+     is not 'entered'. The new data is at the end and there are only 100 datapoints
+     to visualize.
+     So, clear now... the key is added anew on every update. This means that there
+     are no _old_ keys so to say that can be updated or removed!
+  */
+
+  // Update... Slowly dim...
+  rectData
+      .transition()  // Transition is nice when switching between views
+      .attr("fill",'SteelBlue')
+      .attr("stroke",'white')
+      .attr("x",function(d,i){
+        return x(d[1][0]);
+      })
+      .attr("y",function(d,i){
+        return h - y(d[1][index]);
+      })
+      .attr("width",function(d){
+        return (w-2*padding)/N;  
+      })
+      .attr("height",function(d){
+        return y(d[1][index])-padding;
+      })
+      .attr("fill",'SteelBlue')
+      .attr("stroke",'white');
+
+  // New data
+  // Transition from height zero to ...
+  rectData.enter().append("rect")
+      // If new bars need to slide up, uncomment this part
+      // .attr("x",function(d,i){
+      //   return x(d[1][0]);
+      // })
+      // .attr("y",function(d,i){
+      //   return h - y(0);
+      // })
+      // .attr("width",function(d){
+      //   return (w-2*padding)/N;  
+      // })
+      // .attr("height",function(d){
+      //   return 0;
+      // })
+      //.transition()
+      .attr("x",function(d,i){
+        return x(d[1][0]);
+      })
+      .attr("y",function(d,i){
+        return h - y(d[1][index]);
+      })
+      .attr("width",function(d){
+        return (w-2*padding)/N;  
+      })
+      .attr("height",function(d){
+        return y(d[1][index])-padding;
+      })
+      .attr("fill",'SteelBlue')
+      .attr("stroke",'white');
+
+  // Old data
+  rectData.exit().remove();
+  
+
+  // Handle KEYPRESSES ---------------------------------------------
+  d3.select(window).on("keydown", function() {
+    d3.event.preventDefault();
+    switch (d3.event.keyCode) {
+      case 38: 
+        goUpAsync(tz,treeDraw);
+        break ;
+      case 40:
+          // What follows is a way to give insight into what happens
+          var data1 = dataset.slice(0,10);
+
+         //  Keep it simple for now...
+         //  var xMin = data1[0][1][0];
+         //  var xMax_tmp = d3.max(data1, function(d){return d[1][0];});
+         //  var xMax = xMax_tmp + (xMax_tmp - xMin)/10;
+         //  var yMax = d3.max(data1, function(d){return d[1][index];});
+
+         //  var x = d3.scale.linear()
+         //          .domain([xMin,xMax])
+         //          .range([padding,w-padding]);
+         //  var y = d3.scale.linear()
+         //          .domain([0,yMax])
+         //          .range([padding,h-padding]);
+
+         //  xaxisSvg.call(xAxis)
+         //                .attr("class", "x axis")
+         //                .attr("transform", "translate(0," + (h - padding+3) + ")");
+         //  yaxisSvg.call(yAxis)
+         //        .attr("class", "y axis")
+         //        .attr("transform", "translate(" + (padding-3) + ",0)");
+
+         var tmp = dataSvg.selectAll("rect")
+                    .data(data1,keyf);
+
+         tmp.exit().remove();
+
+         tmp
+          .transition()
+          // Not used
+          //.duration(3000)
+          // .attr("x",function(d,i){
+          //   return x(d[1][0]);
+          // })
+          // .attr("y",function(d,i){
+          //   return h - y(d[1][index]);
+          // })
+          // .attr("width",function(d){
+          //   return (w-2*padding)/N*10;  
+          // })
+          // .attr("height",function(d){
+          //   return y(d[1][index])-padding;
+          // })
+          // .attr("fill",'SteelBlue')
+          // .attr("stroke",'white')
+          // .attr("opacity",.5)
+          .call(endall,function() {goDownAsync(0,tz,treeDraw);});
+        
+        break;
+      case 37: 
+        panLeftAsync(tz,treeDraw);
+        break;
+      case 39: 
+        panRightAsync(tz,treeDraw);
+        break; 
+    };
+  });
+
+} // end of treeDraw
+
+}); // end of require.js function
+
+
+</script>
+<script>
+// In order to run in Google Chrome, you need these command line options (MAC):
+// /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome 
+//                        --allow-file-access-from-files --disable-web-security
+</script>
+</body>
+</html>
