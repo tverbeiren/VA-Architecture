@@ -12,6 +12,9 @@ It is an implementation of 3 layered architecture for interactively visualizing 
 * Locustree layer for abstracting away query and caching
 * Backend, running on a cluster
 
+This is what the interface looks like:
+
+![](visualization/interface2.png)
 
 It uses the following libraries:
 
