@@ -3,16 +3,9 @@ package spark.jobserver
 import com.typesafe.config.{Config, ConfigFactory}
 import org.apache.spark._
 import org.apache.spark.SparkContext._
-//import scala.util.Try
 import org.apache.spark.rdd.RDD
 import scala.math._
-//import akka.actor.{ActorRef, Props, PoisonPill}
-//import akka.actor.ActorSystem
-
-//import scala.util.control.Breaks._
-//import collection.JavaConverters._
-//import scala.collection.JavaConversions._
-
+// Only when using Kryo:
 import com.esotericsoftware.kryo.Kryo
 import org.apache.spark.serializer.KryoRegistrator
 
